@@ -504,9 +504,22 @@ def get_completion_collator(model_name: str, tokenizer):
     the BOS-mismatch problem that causes silent no-masking failures.
     Falls back to full-sequence loss (returns None) if setup fails.
     """
-    try:
-        from trl import DataCollatorForCompletionOnlyLM
-    except ImportError:
+    # Newer TRL versions moved this class out of the top-level `trl` namespace
+    # into `trl.trainer`, so try both import paths before giving up.
+    DataCollatorForCompletionOnlyLM = None
+    for _import in (
+        lambda: __import__("trl", fromlist=["DataCollatorForCompletionOnlyLM"]),
+        lambda: __import__("trl.trainer", fromlist=["DataCollatorForCompletionOnlyLM"]),
+        lambda: __import__("trl.trainer.utils", fromlist=["DataCollatorForCompletionOnlyLM"]),
+    ):
+        try:
+            DataCollatorForCompletionOnlyLM = getattr(
+                _import(), "DataCollatorForCompletionOnlyLM"
+            )
+            break
+        except (ImportError, AttributeError):
+            continue
+    if DataCollatorForCompletionOnlyLM is None:
         print("  DataCollatorForCompletionOnlyLM not available in this TRL version — "
               "using full-sequence loss (tiny quality difference, training still works).")
         return None
