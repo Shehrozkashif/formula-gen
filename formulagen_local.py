@@ -495,56 +495,81 @@ def add_text_field(ds: Dataset, tokenizer) -> Dataset:
     return ds.map(_map, batched=True, desc="Formatting text")
 
 
+class CompletionOnlyCollator:
+    """
+    Self-contained completion-only-LM collator (no TRL dependency).
+
+    Computes the LM loss ONLY on the assistant's formula tokens: everything up
+    to and including the response template (e.g. '<|im_start|>assistant\\n') is
+    masked to -100, as are pad tokens. This is the version-proof equivalent of
+    TRL's DataCollatorForCompletionOnlyLM, which some TRL builds no longer ship.
+
+    If the response template isn't found in a sequence (e.g. a very long table
+    truncated to MAX_LENGTH before the assistant turn), that example falls back
+    to full-sequence loss rather than being silently dropped — this guarantees
+    no all-masked batch (which would produce a NaN loss).
+    """
+
+    def __init__(self, response_token_ids, tokenizer, ignore_index: int = -100):
+        self.response_token_ids = list(response_token_ids)
+        self.tokenizer = tokenizer
+        self.ignore_index = ignore_index
+        self._missing = 0
+
+    def _find_response_end(self, ids: list) -> Optional[int]:
+        resp, n = self.response_token_ids, len(self.response_token_ids)
+        for j in range(len(ids) - n + 1):
+            if ids[j:j + n] == resp:
+                return j + n
+        return None
+
+    def __call__(self, examples):
+        # Coerce to plain python ints so subsequence matching is unambiguous
+        # (datasets usually yield lists already, but guard against tensors).
+        input_ids = [[int(t) for t in e["input_ids"]] for e in examples]
+        batch = self.tokenizer.pad(
+            {"input_ids": input_ids}, padding=True, return_tensors="pt",
+        )
+        labels = batch["input_ids"].clone()
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is not None:
+            labels[labels == pad_id] = self.ignore_index
+        for i, ids in enumerate(input_ids):
+            end = self._find_response_end(ids)
+            if end is None:
+                self._missing += 1          # keep full-seq loss for this row
+            else:
+                labels[i, :end] = self.ignore_index
+        batch["labels"] = labels
+        return batch
+
+
 def get_completion_collator(model_name: str, tokenizer):
     """
-    Return DataCollatorForCompletionOnlyLM so the loss is computed ONLY on the
+    Build a completion-only collator so the loss is computed ONLY on the
     assistant's formula tokens, not on the system prompt or question.
 
-    The response_template is pre-tokenized (add_special_tokens=False) to avoid
+    Uses the self-contained CompletionOnlyCollator above (no TRL class needed).
+    The response_template is pre-tokenized with add_special_tokens=False to avoid
     the BOS-mismatch problem that causes silent no-masking failures.
-    Falls back to full-sequence loss (returns None) if setup fails.
+    Returns None (→ full-sequence loss) only for unknown model families.
     """
-    # Newer TRL versions moved this class out of the top-level `trl` namespace
-    # into `trl.trainer`, so try both import paths before giving up.
-    DataCollatorForCompletionOnlyLM = None
-    for _import in (
-        lambda: __import__("trl", fromlist=["DataCollatorForCompletionOnlyLM"]),
-        lambda: __import__("trl.trainer", fromlist=["DataCollatorForCompletionOnlyLM"]),
-        lambda: __import__("trl.trainer.utils", fromlist=["DataCollatorForCompletionOnlyLM"]),
-    ):
-        try:
-            DataCollatorForCompletionOnlyLM = getattr(
-                _import(), "DataCollatorForCompletionOnlyLM"
-            )
-            break
-        except (ImportError, AttributeError):
-            continue
-    if DataCollatorForCompletionOnlyLM is None:
-        print("  DataCollatorForCompletionOnlyLM not available in this TRL version — "
-              "using full-sequence loss (tiny quality difference, training still works).")
-        return None
     name = model_name.lower()
     if "qwen" in name:
         response_str = "<|im_start|>assistant\n"
     elif "gemma" in name:
         response_str = "<start_of_turn>model\n"
     else:
+        print("  Unknown chat format — using full-sequence loss.")
         return None
 
     response_ids = tokenizer.encode(response_str, add_special_tokens=False)
     if not response_ids:
+        print("  Empty response template — using full-sequence loss.")
         return None
-    try:
-        collator = DataCollatorForCompletionOnlyLM(
-            response_template=response_ids,
-            tokenizer=tokenizer,
-            mlm=False,
-        )
-        print(f"  Completion collator ready  (response template: {response_str!r})")
-        return collator
-    except Exception as e:
-        print(f"  Warning: completion collator failed ({e}). Using full-sequence loss.")
-        return None
+    print(f"  Completion collator ready  (response template: {response_str!r}, "
+          f"{len(response_ids)} tokens)")
+    return CompletionOnlyCollator(response_ids, tokenizer)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # EVALUATION UTILITIES
