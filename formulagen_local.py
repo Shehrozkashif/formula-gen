@@ -258,24 +258,24 @@ ADAMW_OPTIM = "paged_adamw_8bit" if DEVICE == "cuda" else "adamw_torch"
 # this list and work up. See the note under MAX_TRAIN_EXAMPLES.
 
 EXPERIMENTS = [
-    # ── Model 1: Gemma-3-1B  (professor's reference — needs HF login) ──────
-    # One-time setup:  huggingface-cli login
-    #                  Accept licence at huggingface.co/google/gemma-3-1b-it
-    ("gemma_1b_lora",  "google/gemma-3-1b-it",        "lora",  False),
-    ("gemma_1b_full",  "google/gemma-3-1b-it",        "full",  False),
-
-    # ── Model 2: Qwen2.5-1.5B-Instruct  (no gate, fits Arc easily) ──────────
+    # ── Fast sanity check: Qwen2.5-1.5B LoRA (no gate, runs out of the box) ─
     ("qwen_1b_lora",   "Qwen/Qwen2.5-1.5B-Instruct",  "lora",  False),
-    ("qwen_1b_full",   "Qwen/Qwen2.5-1.5B-Instruct",  "full",  False),
 
-    # ── Push for 90% EM: largest allowed model (≤3B), bf16 LoRA, no quant ───
-    # Qwen2.5-3B is the ceiling for this project (must stay under/at 3B).
-    # It fits the Arc's 16 GB easily and is the realistic path past ~75% EM.
-    # Uncomment to run:
-    # ("qwen_3b_lora",   "Qwen/Qwen2.5-3B-Instruct",    "lora",  False),
+    # ── The 90% push: Qwen2.5-3B (the ≤3B ceiling), bf16 LoRA, no quant ─────
+    ("qwen_3b_lora",   "Qwen/Qwen2.5-3B-Instruct",    "lora",  False),
+
+    # ── Optional extra comparisons (uncomment to add) ──────────────────────
+    # ("qwen_1b_full",   "Qwen/Qwen2.5-1.5B-Instruct",  "full",  False),
+
+    # ── Gemma-3-1B (professor's reference) is a GATED model. To use it:
+    #      1) accept the licence at  huggingface.co/google/gemma-3-1b-it
+    #      2) huggingface-cli login          (or set the HF_TOKEN env var)
+    #    then uncomment:
+    # ("gemma_1b_lora",  "google/gemma-3-1b-it",        "lora",  False),
+    # ("gemma_1b_full",  "google/gemma-3-1b-it",        "full",  False),
 
     # ── Optional: curriculum (needs data/train_alpha.json) ──────────────────
-    # ("gemma_1b_lora_curric", "google/gemma-3-1b-it",                 "lora",  True),
+    # ("qwen_3b_lora_curric", "Qwen/Qwen2.5-3B-Instruct",  "lora",  True),
 ]
 
 # ── Data caps ─────────────────────────────────────────────────────────────
