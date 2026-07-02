@@ -5,14 +5,14 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 """
-FormulaGen — Excel Formula Generation  |  Intel AI PC (Arc 140V GPU, 16 GB)
-===========================================================================
-Professor's benchmark: 1B Gemma, LoRA FT, NO quantization → 70s% exact match
-This script replicates that approach and extends it to a second model.
+FormulaGen — Excel Formula Generation  |  Intel AI PC (Arc 140V GPU, 24 GB shared)
+===================================================================================
+LoRA fine-tuning of Qwen2.5 models (1.5B / 3B) for Excel formula generation,
+NO quantization — bf16 base + LoRA adapters.
 
 This version is BACKEND-AGNOSTIC: it auto-detects Intel Arc (XPU) → NVIDIA
 (CUDA) → CPU and uses NO quantization (bitsandbytes is CUDA-only and is not
-needed here — the Arc 140V has 16 GB of shared memory, plenty for fp16/bf16).
+needed here — the Arc 140V has 24 GB of shared memory, plenty for fp16/bf16).
 
 SETUP
 -----
@@ -27,20 +27,12 @@ SETUP
                    "peft>=0.10.0" "trl>=0.8.6" \
                    sentencepiece protobuf
 
-2. Hugging Face login (needed for gated Gemma model):
-       pip install huggingface_hub
-       huggingface-cli login
-   Then accept the Gemma licence at: https://huggingface.co/google/gemma-3-1b-it
-   If you prefer to skip the licence step, replace the Gemma entry in EXPERIMENTS
-   with "Qwen/Qwen2.5-1B-Instruct" (no gate required).
-
-3. Place data files in ./data/:
+2. Place data files in ./data/:
        data/train.json          (~68 MB)
        data/valid.json          (~7 MB)
        data/test.json           (~13 MB)
-       data/train_alpha.json    (~72 MB, optional — enables curriculum learning)
 
-4. Run:
+3. Run:
        python formulagen_local.py
 
 OUTPUT
@@ -49,19 +41,18 @@ OUTPUT
     results/<exp_id>/    — metrics.json + predictions.jsonl
 
 ═══════════════════════════════════════════════════════════════════
-NO QUANTIZATION ON THE INTEL ARC (16 GB)
+NO QUANTIZATION ON THE INTEL ARC (24 GB)
 ═══════════════════════════════════════════════════════════════════
-The Arc 140V exposes ~16 GB of shared memory — there is no reason to
+The Arc 140V exposes ~24 GB of shared memory — there is no reason to
 quantize, and bitsandbytes (4-bit/8-bit) is CUDA-only anyway. Everything
-here runs in bf16 (native on Arc) with NO quantization, which is exactly
-the setup that matches the professor's full-precision result.
+here runs in bf16 (native on Arc) with NO quantization.
 
 LoRA bf16 memory (base frozen, only tiny adapters train, grad-checkpointing):
-    1B   → ~2 GB weights + ~3 GB activations(bs=4) ≈  5 GB   ← easy
-    3B   → ~6 GB weights + ~4 GB                   ≈ 10 GB   ← fits (project ceiling)
+    1.5B → ~3 GB weights + ~6 GB activations(bs=8)  ≈  9 GB   ← easy
+    3B   → ~6 GB weights + ~9 GB activations(bs=8)  ≈ 15 GB   ← fits with headroom
 
 Full FT bf16 memory (weights + grads + optimizer):
-    1B   ≈ 5 GB     1.5B ≈ 8 GB    ← both fit; ≥3B → use LoRA instead
+    1B   ≈ 6 GB     1.5B ≈ 9 GB    ← both fit; ≥3B → use LoRA instead
 
 ═══════════════════════════════════════════════════════════════════
 PATH TO HIGH EXACT MATCH  (target: 90%)
@@ -73,15 +64,13 @@ PATH TO HIGH EXACT MATCH  (target: 90%)
 
 Realistic expectations:
     5k examples, 1B model        → ~40–55% EM
-    full 52k, 1B/1.5B model      → ~65–75% EM  (professor's benchmark)
+    full 52k, 1B/1.5B model      → ~65–75% EM
     full 52k, Qwen2.5-3B (max)   → the best shot at ~80–90% EM
 
->>> Project constraint: models must be ≤3B. 90% EM is NOT reliably reachable
-    with a 1B model, so use Qwen2.5-3B-Instruct (the ceiling) with bf16 LoRA on
-    the full 52k set. It is pre-listed (commented) in EXPERIMENTS below as
-    qwen_3b_lora — uncomment it to run. If 3B still falls short of 90%, the
-    remaining levers are: more epochs, higher LoRA rank (r=128), and cleaning/
-    augmenting the training data — not a bigger model.
+>>> Project constraint: models must be ≤3B, so Qwen2.5-3B-Instruct is the
+    ceiling. If 3B still falls short of 90%, the remaining levers are: more
+    epochs, higher LoRA rank (r=128), and cleaning/augmenting the training
+    data — not a bigger model.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -106,12 +95,10 @@ from peft import (
     PeftModel,
     TaskType,
     get_peft_model,
-    prepare_model_for_kbit_training,
 )
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     TrainerCallback,
 )
 from trl import SFTConfig, SFTTrainer
@@ -238,56 +225,26 @@ ADAMW_OPTIM = "paged_adamw_8bit" if DEVICE == "cuda" else "adamw_torch"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Experiments ─────────────────────────────────────────────────────────────
-# (exp_id,  hf_model_id,                          ft_type,       curriculum)
+# (exp_id,  hf_model_id,                          ft_type)
 #
 # ft_type options:
-#   "lora"       → LoRA with fp16 base, NO quantization (matches professor)
-#   "lora_4bit"  → QLoRA with 4-bit NF4 base (lower VRAM, lower EM)
-#   "full"       → Full fine-tuning (fp16 for ≤1B; auto 8-bit for 1.5B+ on 6GB)
-#
-# Both models + both approaches = professor's 2×2 comparison matrix.
-# Run one at a time or all together (they save checkpoints between runs).
-
-# NOTE on Intel XPU: only the NO-QUANT ft_types work ('lora', 'full').
-# 'lora_4bit' and 8-bit full FT need bitsandbytes (CUDA-only) and will raise a
-# clear error on this machine. All experiments below are no-quant by design.
-#
-# REACHING 90% EM: the 1B models below top out around 70-75% EM (the professor's
-# benchmark). 90% almost certainly needs a STRONGER base model. The 16 GB Arc can
-# fit a 3B (and even a 7B) model with bf16 LoRA — start the run from the bottom of
-# this list and work up. See the note under MAX_TRAIN_EXAMPLES.
+#   "lora"  → LoRA with bf16 base, NO quantization
+#   "full"  → Full fine-tuning (bf16, ≤1.5B models only)
 
 EXPERIMENTS = [
-    # ── Fast sanity check: Qwen2.5-1.5B LoRA (no gate, runs out of the box) ─
-    ("qwen_1b_lora",   "Qwen/Qwen2.5-1.5B-Instruct",  "lora",  False),
+    # ── Fast sanity check: Qwen2.5-1.5B LoRA ────────────────────────────────
+    ("qwen_1b_lora",   "Qwen/Qwen2.5-1.5B-Instruct",  "lora"),
 
     # ── The 90% push: Qwen2.5-3B (the ≤3B ceiling), bf16 LoRA, no quant ─────
-    ("qwen_3b_lora",   "Qwen/Qwen2.5-3B-Instruct",    "lora",  False),
+    ("qwen_3b_lora",   "Qwen/Qwen2.5-3B-Instruct",    "lora"),
 
-    # ── Optional extra comparisons (uncomment to add) ──────────────────────
-    # ("qwen_1b_full",   "Qwen/Qwen2.5-1.5B-Instruct",  "full",  False),
-
-    # ── Gemma-3-1B (professor's reference) is a GATED model. To use it:
-    #      1) accept the licence at  huggingface.co/google/gemma-3-1b-it
-    #      2) huggingface-cli login          (or set the HF_TOKEN env var)
-    #    then uncomment:
-    # ("gemma_1b_lora",  "google/gemma-3-1b-it",        "lora",  False),
-    # ("gemma_1b_full",  "google/gemma-3-1b-it",        "full",  False),
-
-    # ── Optional: curriculum (needs data/train_alpha.json) ──────────────────
-    # ("qwen_3b_lora_curric", "Qwen/Qwen2.5-3B-Instruct",  "lora",  True),
+    # ── Optional extra comparison (uncomment to add) ────────────────────────
+    # ("qwen_1b_full",   "Qwen/Qwen2.5-1.5B-Instruct",  "full"),
 ]
 
 # ── Data caps ─────────────────────────────────────────────────────────────
-# TO REACH 70s% EM: set MAX_TRAIN_EXAMPLES = None (full 52k dataset)
-# Full dataset takes ~5–8 h on RTX 2060 — run overnight.
-#
-# Quick test with 5k examples first to verify the pipeline works,
-# then re-run with None for full-scale results.
-# ─────────────────────────────────────────────────────────────────────────────
 # CRITICAL: the full 52k training set is REQUIRED to reach 70%+ EM.
 # With only 5k examples you will get ~45–55% EM regardless of model/FT choice.
-# Run overnight — 1B LoRA × 52k × 5 epochs ≈ 6–8 h on RTX 2060.
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_TRAIN_EXAMPLES = None     # None = all 52,203 train examples  ← REQUIRED for 70%+
 MAX_EVAL_EXAMPLES  = 300      # in-training validation (kept small for speed)
@@ -295,51 +252,34 @@ MAX_TEST_SAMPLES   = None     # None = full 10,111 test examples  ← needed for
 
 # ── General ──────────────────────────────────────────────────────────────
 SEED          = 42
-MAX_LENGTH    = 512      # 16 GB Arc has room for the full 512-token context
+MAX_LENGTH    = 512      # 24 GB Arc has room for the full 512-token context
 WARMUP_RATIO  = 0.05
 LOGGING_STEPS = 10
 
-# ── LoRA (bf16 base on Arc, NO quantization — professor's approach) ────────
-# Memory on 16 GB Arc:  1B bf16 → ~5-6 GB at bs=4  (gradient checkpointing on)
+# ── LoRA (bf16 base on Arc, NO quantization) ───────────────────────────────
+# Memory on 24 GB Arc: 3B bf16 LoRA → ~15 GB at bs=8 (gradient checkpointing on)
 LORA_EPOCHS  = 5         # more epochs compensate for partial-param updates
 LORA_LR      = 2e-4
-LORA_BS      = 4         # 16 GB lets us push the per-device batch up from 1 → 4
-LORA_GRAD_AC = 16        # effective global batch = 4×16 = 64  (unchanged)
+LORA_BS      = 8         # 24 GB lets us push the per-device batch up from 4 → 8
+LORA_GRAD_AC = 8         # effective global batch = 8×8 = 64  (unchanged)
 LORA_R       = 64        # r=64 is key — lower rank hurts EM on structured tasks
 LORA_ALPHA   = 128       # 2×rank
 LORA_DROPOUT = 0.05
 
-# ── QLoRA (4-bit NF4 base) — fallback when LoRA fp16 doesn't fit ──────────
-# Lower EM but lower VRAM (~2–2.5 GB for 1.5B).
-QLORA_EPOCHS  = 5
-QLORA_LR      = 2e-4
-QLORA_BS      = 2
-QLORA_GRAD_AC = 32
-QLORA_R       = 64
-QLORA_ALPHA   = 128
-QLORA_DROPOUT = 0.05
-
-# ── Full FT ────────────────────────────────────────────────────────────────
-# For ≤1B models: fp16 (4.8 GB on 6GB GPU at bs=1)
-# For 1.5B+:      auto 8-bit base to fit in 6 GB
+# ── Full FT (bf16, ≤1.5B models only — larger models need ft_type='lora') ──
 FULL_EPOCHS  = 3
 FULL_LR      = 2e-5
-FULL_BS      = 2         # 16 GB Arc fits bs=2 for a 1B full-FT model
-FULL_GRAD_AC = 32        # effective global batch = 64
-# Models up to this size do fp16/bf16 full FT in 16 GB. ABOVE it, full FT won't
-# fit and there is NO 8-bit fallback on Intel XPU (bitsandbytes is CUDA-only),
-# so larger models require ft_type='lora'.  1.5B full FT ≈ 7 GB → fits.
-FULL_8BIT_THRESHOLD_GB = 2.0
-
-# ── Curriculum (stage 1 on FormulaAlpha, stage 2 on Formula2) ─────────────
-CURRIC_EPOCHS = 1
-CURRIC_LR_MUL = 2.0
+FULL_BS      = 4         # 24 GB Arc fits bs=4 for a 1.5B full-FT model
+FULL_GRAD_AC = 16        # effective global batch = 64
+# Above this size, full FT needs 8-bit weights (bitsandbytes, CUDA-only) which
+# isn't available on Intel XPU — larger models must use ft_type='lora'.
+FULL_MAX_PARAMS_B = 2.0
 
 # ── Inference / Evaluation ────────────────────────────────────────────────
-EVAL_BATCH_SIZE = 8    # 16 GB Arc handles beam-search inference at bs=8 comfortably
+EVAL_BATCH_SIZE = 16   # 24 GB Arc handles beam-search inference at bs=16 comfortably
 MAX_NEW_TOKENS  = 256
 
-# LoRA target modules (applies to all LoRA ft_types)
+# LoRA target modules
 LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",          # attention
     "gate_proj", "up_proj", "down_proj",              # MLP / FFN
@@ -349,16 +289,9 @@ LORA_TARGET_MODULES = [
 # DATA FILE CHECK
 # ═══════════════════════════════════════════════════════════════════════════
 
-def ensure_data_files(required: list, optional: list = None) -> None:
-    optional = optional or []
-    missing_opt = [f for f in optional
-                   if not os.path.exists(os.path.join(DATA_DIR, f))]
+def ensure_data_files(required: list) -> None:
     missing_req = [f for f in required
                    if not os.path.exists(os.path.join(DATA_DIR, f))]
-
-    if missing_opt:
-        print(f"Optional files not found (curriculum disabled): {missing_opt}")
-
     if missing_req:
         raise FileNotFoundError(
             f"\nMissing required data files: {missing_req}\n"
@@ -367,7 +300,6 @@ def ensure_data_files(required: list, optional: list = None) -> None:
             "  data/train.json          (~68 MB)\n"
             "  data/valid.json          (~7 MB)\n"
             "  data/test.json           (~13 MB)\n"
-            "  data/train_alpha.json    (~72 MB, optional)\n"
         )
     print("All required data files found.")
 
@@ -557,8 +489,6 @@ def get_completion_collator(model_name: str, tokenizer):
     name = model_name.lower()
     if "qwen" in name:
         response_str = "<|im_start|>assistant\n"
-    elif "gemma" in name:
-        response_str = "<start_of_turn>model\n"
     else:
         print("  Unknown chat format — using full-sequence loss.")
         return None
@@ -767,16 +697,23 @@ def run_evaluation(
 # MODEL LOADING
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _patch_quantization_validation() -> None:
-    """Disable Transformers ≥4.52 check that blocks quantized full FT."""
-    _noop = lambda model: None  # noqa: E731
-    for mod_name in ("transformers.trainer", "transformers.trainer_utils"):
-        try:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, "validate_quantization_for_training"):
-                setattr(mod, "validate_quantization_for_training", _noop)
-        except ImportError:
-            pass
+def _load_causal_lm(model_name: str, **kwargs):
+    """
+    Load a causal LM preferring 'sdpa' attention (fused, hardware-accelerated)
+    over 'eager'. 'eager' materializes attention with plain Python-level ops
+    and is dramatically slower on XPU/CUDA — 'sdpa' is a drop-in speed win
+    for any model that supports it (Qwen2 does). Falls back to 'eager' only
+    if the installed torch/transformers can't build the model with sdpa.
+    """
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_name, attn_implementation="sdpa", **kwargs
+        )
+    except Exception as e:
+        print(f"  sdpa attention unavailable ({e}); falling back to eager.")
+        return AutoModelForCausalLM.from_pretrained(
+            model_name, attn_implementation="eager", **kwargs
+        )
 
 
 def _estimate_param_billions(model_name: str) -> float:
@@ -794,18 +731,11 @@ def _estimate_param_billions(model_name: str) -> float:
 
 def load_model_lora_noquant(model_name: str):
     """
-    fp16 base model, NO quantization — matches professor's LoRA setup.
-    Base model is fully frozen; only LoRA adapters will be trained.
-
-    Memory (with gradient checkpointing):
-        1B  fp16 → ~2 GB weights + ~1 GB activations = ~3 GB  ← very comfortable
-        1.5B fp16 → ~3 GB weights + ~1.5 GB activations = ~4.5 GB  ← fits on 6 GB
+    bf16 base model, NO quantization. Base model is fully frozen; only LoRA
+    adapters will be trained.
     """
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=COMPUTE_DTYPE,
-        trust_remote_code=True,
-        attn_implementation="eager",
+    model = _load_causal_lm(
+        model_name, torch_dtype=COMPUTE_DTYPE, trust_remote_code=True,
     ).to(DEVICE)
     model.gradient_checkpointing_enable()
     total = sum(p.numel() for p in model.parameters())
@@ -814,93 +744,24 @@ def load_model_lora_noquant(model_name: str):
     return model
 
 
-def load_model_lora_4bit(model_name: str):
-    """
-    4-bit NF4 base (QLoRA) — lower memory than fp16 but ~5-10 pp lower EM.
-    Use only when fp16 LoRA doesn't fit or as an ablation comparison.
-
-    Memory:
-        1.5B 4-bit → ~0.75 GB weights + ~1.5 GB activations = ~2.5 GB
-    """
-    if DEVICE != "cuda":
-        raise RuntimeError(
-            "ft_type='lora_4bit' needs bitsandbytes, which is CUDA-only and is "
-            "NOT supported on Intel XPU / CPU. Use ft_type='lora' (no quant) — "
-            "the Arc's 16 GB has plenty of room for bf16 LoRA."
-        )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        ),
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-        attn_implementation="eager",
-        device_map="auto",
-    )
-    print(f"  QLoRA 4-bit — {sum(p.numel() for p in model.parameters())/1e9:.2f}B params")
-    return prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-
-
 def load_model_full_ft(model_name: str):
     """
-    Full fine-tuning — all parameters trained.
-
-    Strategy based on model size (auto-detected from name):
-        ≤ FULL_8BIT_THRESHOLD_GB params: fp16 (no quantization)
-            Memory: 2 GB (weights) + 2 GB (grads) + 0.5 GB (Adafactor) ≈ 4.8 GB
-        >  threshold:                   8-bit base to halve weight memory
-            Memory: 1.5 GB (8-bit wts) + 3 GB (fp16 grads) + 0.75 GB ≈ 5.75 GB
+    Full fine-tuning — all parameters trained, bf16, no quantization.
+    Only intended for models ≤ FULL_MAX_PARAMS_B (larger models don't fit
+    without 8-bit weights, which needs bitsandbytes / CUDA and isn't
+    available on Intel XPU — use ft_type='lora' for those instead).
     """
-    _patch_quantization_validation()
     n_billions = _estimate_param_billions(model_name)
-
-    if n_billions <= FULL_8BIT_THRESHOLD_GB:
-        print(f"  Full FT {COMPUTE_DTYPE} — {n_billions:.1f}B params  (no quantization)")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=COMPUTE_DTYPE,
-            trust_remote_code=True,
-            attn_implementation="eager",
-        ).to(DEVICE)
-    else:
-        if DEVICE != "cuda":
-            raise RuntimeError(
-                f"Full FT of a {n_billions:.1f}B model won't fit in 16 GB without "
-                "8-bit weights, and 8-bit (bitsandbytes) is CUDA-only. On this Intel "
-                "Arc machine use ft_type='lora' for models this size."
-            )
-        print(
-            f"  Full FT 8-bit — {n_billions:.1f}B params  "
-            f"(8-bit weights to fit {vram_gb:.0f} GB VRAM; "
-            f"quality slightly below pure fp16 but necessary for this GPU)"
+    if n_billions > FULL_MAX_PARAMS_B:
+        raise RuntimeError(
+            f"Full FT of a {n_billions:.1f}B model won't fit without 8-bit "
+            "weights (bitsandbytes, CUDA-only, unavailable on Intel XPU). "
+            "Use ft_type='lora' for models this size."
         )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-            ),
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            attn_implementation="eager",
-            device_map="auto",
-        )
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-        # prepare_model_for_kbit_training freezes everything by default (designed for LoRA).
-        # For full FT unfreeze ALL float-dtype parameters (int8 quantized tensors cannot
-        # have requires_grad=True — that would raise RuntimeError).
-        for param in model.parameters():
-            if param.dtype.is_floating_point:
-                param.requires_grad_(True)
-        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  8-bit full FT — trainable: {n_train/1e9:.2f}B float params "
-              f"(quantized weight tensors updated via 8-bit backward)")
-        return model
-
+    print(f"  Full FT {COMPUTE_DTYPE} — {n_billions:.1f}B params  (no quantization)")
+    model = _load_causal_lm(
+        model_name, torch_dtype=COMPUTE_DTYPE, trust_remote_code=True,
+    ).to(DEVICE)
     model.gradient_checkpointing_enable()
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable: {trainable/1e9:.2f}B")
@@ -956,7 +817,7 @@ def make_sft_config(
         logging_steps=LOGGING_STEPS,
         eval_strategy="epoch",
         save_strategy="steps",   # save every N steps so you can pause/resume anytime
-        save_steps=100,           # ~41 min per save on RTX 2060 Max-Q; reduced to resume more frequently
+        save_steps=100,           # checkpoint often so a run can be paused/resumed cheaply
         save_total_limit=2,       # keep only last 2 checkpoints (saves disk space)
         load_best_model_at_end=False,
         report_to="none",
@@ -1011,16 +872,14 @@ def train_stage(model, tokenizer, train_ds, valid_ds, cfg: SFTConfig,
 # SINGLE EXPERIMENT  (train + save + evaluate)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_experiment(
-    exp_id: str, model_name: str, ft_type: str, curriculum: bool
-) -> dict:
+def run_experiment(exp_id: str, model_name: str, ft_type: str) -> dict:
     device_empty_cache()
     gc.collect()
 
     print(f"\n{'═'*65}")
     print(f"  EXPERIMENT : {exp_id}")
     print(f"  Model      : {model_name}")
-    print(f"  FT type    : {ft_type.upper()}{'  +  CURRICULUM' if curriculum else ''}")
+    print(f"  FT type    : {ft_type.upper()}")
     print(f"{'═'*65}")
 
     out_dir = os.path.join(OUTPUTS_DIR, exp_id)
@@ -1045,12 +904,6 @@ def run_experiment(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # ── Curriculum availability ───────────────────────────────────────────
-    alpha_path = os.path.join(DATA_DIR, "train_alpha.json")
-    use_curric = curriculum and os.path.exists(alpha_path)
-    if curriculum and not use_curric:
-        print("  train_alpha.json not found — running without curriculum.")
-
     # ── Load training data ────────────────────────────────────────────────
     print("\nLoading data …")
     train_ex = load_split(
@@ -1065,14 +918,6 @@ def run_experiment(
     valid_ds = add_text_field(build_hf_dataset(valid_ex), tokenizer)
     print(f"  Train : {len(train_ds):,}  |  Valid (in-training): {len(valid_ds):,}")
 
-    if use_curric:
-        alpha_ex = load_split(
-            alpha_path, formula_key="FormulaAlpha",
-            max_examples=MAX_TRAIN_EXAMPLES,
-        )
-        alpha_ds = add_text_field(build_hf_dataset(alpha_ex), tokenizer)
-        print(f"  FormulaAlpha (curriculum): {len(alpha_ds):,}")
-
     # Completion collator masks prompt tokens so loss is formula-tokens only
     completion_collator = get_completion_collator(model_name, tokenizer)
 
@@ -1081,7 +926,6 @@ def run_experiment(
         print(f"\nLoading model [{ft_type.upper()}] …")
 
         if ft_type == "lora":
-            # ── Professor's approach: fp16 base, no quantization ─────────
             model   = load_model_lora_noquant(model_name)
             lora_c  = build_lora_config(model, LORA_R, LORA_ALPHA, LORA_DROPOUT)
             model   = get_peft_model(model, lora_c)
@@ -1095,21 +939,7 @@ def run_experiment(
             eval_bs                 = EVAL_BATCH_SIZE
             lora_r_used             = LORA_R
 
-        elif ft_type == "lora_4bit":
-            # ── QLoRA fallback: 4-bit NF4 base ───────────────────────────
-            model   = load_model_lora_4bit(model_name)
-            lora_c  = build_lora_config(model, QLORA_R, QLORA_ALPHA, QLORA_DROPOUT)
-            model   = get_peft_model(model, lora_c)
-            model.print_trainable_parameters()
-            model.enable_input_require_grads()
-            epochs, lr, bs, grad_ac = QLORA_EPOCHS, QLORA_LR, QLORA_BS, QLORA_GRAD_AC
-            optim                   = ADAMW_OPTIM
-            use_fp16, use_bf16      = training_precision()
-            eval_bs                 = 2
-            lora_r_used             = QLORA_R
-
         elif ft_type == "full":
-            # ── Full FT: fp16 for ≤1.2B, 8-bit for larger ───────────────
             # Adafactor manages its own precision — disable AMP (fp16/bf16=False)
             # so it doesn't conflict with the optimizer's internal scaler.
             model                   = load_model_full_ft(model_name)
@@ -1120,29 +950,9 @@ def run_experiment(
             lora_r_used             = None
 
         else:
-            raise ValueError(f"Unknown ft_type: {ft_type!r}. "
-                             "Choose 'lora', 'lora_4bit', or 'full'.")
+            raise ValueError(f"Unknown ft_type: {ft_type!r}. Choose 'lora' or 'full'.")
 
-        # ── Stage 1: curriculum (optional) ───────────────────────────────
-        if use_curric:
-            print("\n[Stage 1] Curriculum pre-training on FormulaAlpha …")
-            s1_cfg = make_sft_config(
-                os.path.join(out_dir, "stage1"),
-                epochs=CURRIC_EPOCHS, bs=bs, grad_ac=grad_ac,
-                lr=lr * CURRIC_LR_MUL, optim=optim, n_train=len(alpha_ds),
-                use_fp16=use_fp16, use_bf16=use_bf16, eval_bs=eval_bs,
-            )
-            trainer = train_stage(model, tokenizer, alpha_ds, valid_ds, s1_cfg,
-                                   data_collator=completion_collator)
-            model   = trainer.model
-            del trainer; device_empty_cache(); gc.collect()
-
-        # ── Stage 2 (main): fine-tune on Formula2 ────────────────────────
-        stage_label = (
-            "[Stage 2] Fine-tuning on Formula2 …" if use_curric
-            else f"Training {ft_type.upper()} …"
-        )
-        print(f"\n{stage_label}")
+        print(f"\nTraining {ft_type.upper()} …")
         s2_cfg = make_sft_config(
             out_dir, epochs=epochs, bs=bs, grad_ac=grad_ac,
             lr=lr, optim=optim, n_train=len(train_ds),
@@ -1158,13 +968,9 @@ def run_experiment(
         with open(train_cfg_path, "w") as f:
             json.dump({
                 "model_name": model_name, "ft_type": ft_type,
-                "curriculum": use_curric,
                 "epochs": epochs, "lr": lr, "bs": bs, "grad_ac": grad_ac,
                 "lora_r": lora_r_used,
-                "quantization": "none" if ft_type == "lora" else
-                                "4bit_nf4" if ft_type == "lora_4bit" else
-                                ("8bit" if _estimate_param_billions(model_name) > FULL_8BIT_THRESHOLD_GB
-                                 else "none"),
+                "quantization": "none",
             }, f, indent=2)
         del trainer; device_empty_cache(); gc.collect()
 
@@ -1175,10 +981,9 @@ def run_experiment(
     )
     print(f"  Test examples : {len(test_ex):,}")
 
-    # ── Reload merged model in fp16 for inference ─────────────────────────
+    # ── Reload merged model for inference ─────────────────────────────────
     print("Loading model for inference …")
-    is_lora_type = ft_type in ("lora", "lora_4bit")
-    if is_lora_type:
+    if ft_type == "lora":
         base      = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=COMPUTE_DTYPE,
             trust_remote_code=True,
@@ -1200,8 +1005,7 @@ def run_experiment(
 
     results = run_evaluation(inf_model, inf_tok, test_ex, res_dir, label=exp_id)
     results.update({
-        "model_name": model_name, "ft_type": ft_type,
-        "exp_id": exp_id, "curriculum": use_curric,
+        "model_name": model_name, "ft_type": ft_type, "exp_id": exp_id,
     })
 
     del inf_model; device_empty_cache(); gc.collect()
@@ -1285,15 +1089,12 @@ def set_seed(seed: int) -> None:
 if __name__ == "__main__":
     set_seed(SEED)
 
-    ensure_data_files(
-        required=["train.json", "valid.json", "test.json"],
-        optional=["train_alpha.json"],
-    )
+    ensure_data_files(required=["train.json", "valid.json", "test.json"])
 
     all_results: dict = {}
-    for exp_id, model_name, ft_type, curriculum in EXPERIMENTS:
+    for exp_id, model_name, ft_type in EXPERIMENTS:
         try:
-            result = run_experiment(exp_id, model_name, ft_type, curriculum)
+            result = run_experiment(exp_id, model_name, ft_type)
             all_results[exp_id] = result
             em = result["overall"]["exact_match"] * 100
             print(f"\n  DONE  {exp_id}  →  EM = {em:.2f}%\n")
@@ -1302,7 +1103,7 @@ if __name__ == "__main__":
             print(f"\n  FAILED  {exp_id}: {e}")
             traceback.print_exc()
             all_results[exp_id] = None
-            torch.cuda.empty_cache()
+            device_empty_cache()
             gc.collect()
 
     print_comparison_table(all_results)
